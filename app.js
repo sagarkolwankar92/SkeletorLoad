@@ -196,7 +196,7 @@ function mergeNearby(boxes) {
       const verticalOverlap = Math.min(item.y + item.height, box.y + box.height) - Math.max(item.y, box.y);
       const sameLine = verticalOverlap > Math.min(item.height, box.height) * 0.45;
       const gap = box.x - (item.x + item.width);
-      return sameLine && gap >= 0 && gap < 16 && Math.abs(item.height - box.height) < 18;
+      return sameLine && gap >= 0 && gap < 32 && Math.abs(item.height - box.height) < 24;
     });
 
     if (match) {
@@ -242,18 +242,22 @@ function renderPreview() {
     `<rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}"></rect>`
   ).join("");
 
+  const cw = canvas.width;
   preview.innerHTML = `
     <defs>
-      <linearGradient id="shine" x1="0%" y1="0%" x2="100%" y2="0%">
-        <stop offset="0%" stop-color="#dfe6ee"></stop>
-        <stop offset="45%" stop-color="#f7f9fb"></stop>
+      <linearGradient id="shine" x1="0" y1="0" x2="${cw}" y2="0" gradientUnits="userSpaceOnUse">
+        <stop offset="0%"   stop-color="#dfe6ee"></stop>
+        <stop offset="40%"  stop-color="#f0f4f8"></stop>
+        <stop offset="50%"  stop-color="#f7f9fb"></stop>
+        <stop offset="60%"  stop-color="#f0f4f8"></stop>
         <stop offset="100%" stop-color="#dfe6ee"></stop>
+        <animateTransform attributeName="gradientTransform" type="translate"
+          values="${-cw * 2} 0; ${cw * 2} 0"
+          dur="1.4s" calcMode="linear" repeatCount="indefinite"/>
       </linearGradient>
     </defs>
     <style>
       #skeletonPreview rect { fill: url(#shine); }
-      #skeletonPreview rect { animation: pulse 1.4s ease-in-out infinite; transform-origin: center; }
-      @keyframes pulse { 0%, 100% { opacity: .72; } 50% { opacity: 1; } }
     </style>
     ${rects}
   `;
@@ -263,27 +267,23 @@ function renderPreview() {
 function svgMarkup() {
   const radius = Number(controls.radius.value);
   const rects = shapes.map((shape) =>
-    `  <rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" />`
+    `  <rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" fill="url(#skeleton-shine)" />`
   ).join("\n");
 
-  return `<svg class="skeleton-loader" viewBox="0 0 ${canvas.width} ${canvas.height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading">
+  const cw = canvas.width;
+  return `<svg class="skeleton-loader" viewBox="0 0 ${cw} ${canvas.height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading">
   <defs>
-    <linearGradient id="skeleton-shine" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#dfe6ee" />
-      <stop offset="45%" stop-color="#f7f9fb" />
+    <linearGradient id="skeleton-shine" x1="0" y1="0" x2="${cw}" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#dfe6ee" />
+      <stop offset="40%"  stop-color="#f0f4f8" />
+      <stop offset="50%"  stop-color="#f7f9fb" />
+      <stop offset="60%"  stop-color="#f0f4f8" />
       <stop offset="100%" stop-color="#dfe6ee" />
+      <animateTransform attributeName="gradientTransform" type="translate"
+        values="${-cw * 2} 0; ${cw * 2} 0"
+        dur="1.4s" calcMode="linear" repeatCount="indefinite"/>
     </linearGradient>
   </defs>
-  <style>
-    .skeleton-loader rect {
-      fill: url(#skeleton-shine);
-      animation: skeleton-pulse 1.4s ease-in-out infinite;
-    }
-    @keyframes skeleton-pulse {
-      0%, 100% { opacity: .72; }
-      50% { opacity: 1; }
-    }
-  </style>
 ${rects}
 </svg>`;
 }
@@ -381,9 +381,14 @@ function renderCode() {
   const mode = exportMode();
   downloadButton.textContent = mode === "gif" ? "Download GIF" : "Download Lottie";
   copyButton.disabled = mode === "gif";
-  outputCode.value = mode === "gif"
-    ? "GIF export creates an animated .gif file when you press Download GIF."
-    : lottieMarkup();
+
+  if (mode === "gif") {
+    outputCode.value = "GIF export creates an animated .gif file when you press Download GIF.\n\nSwitch to Lottie to see copyable JSON in this panel.";
+  } else if (mode === "lottie") {
+    outputCode.value = lottieMarkup();
+  } else {
+    outputCode.value = svgMarkup();
+  }
 }
 
 function downloadBlob(blob, filename) {
@@ -479,6 +484,10 @@ function renderGifIndices(progress) {
 
   gifCtx.fillStyle = "#ffffff";
   gifCtx.fillRect(0, 0, width, height);
+
+  // Sweep position based on overall canvas progress (not per-shape)
+  const sweepX = Math.round((width * 2 + width) * progress - width);
+
   for (const shape of shapes) {
     const x = Math.round(shape.x * scale);
     const y = Math.round(shape.y * scale);
@@ -486,14 +495,20 @@ function renderGifIndices(progress) {
     const shapeHeight = Math.max(1, Math.round(shape.height * scale));
     gifCtx.fillStyle = "#dfe6ee";
     gifCtx.fillRect(x, y, shapeWidth, shapeHeight);
-    const shineWidth = Math.max(24, Math.round(shapeWidth * 0.42));
-    const shineX = x - shineWidth + Math.round((shapeWidth + shineWidth * 2) * progress);
-    const gradient = gifCtx.createLinearGradient(shineX, y, shineX + shineWidth, y);
+    const shineWidth = Math.max(40, Math.round(width * 0.25));
+    const gradient = gifCtx.createLinearGradient(sweepX, y, sweepX + shineWidth, y);
     gradient.addColorStop(0, "#dfe6ee");
+    gradient.addColorStop(0.4, "#f0f4f8");
     gradient.addColorStop(0.5, "#f7f9fb");
+    gradient.addColorStop(0.6, "#f0f4f8");
     gradient.addColorStop(1, "#dfe6ee");
+    gifCtx.save();
+    gifCtx.beginPath();
+    gifCtx.rect(x, y, shapeWidth, shapeHeight);
+    gifCtx.clip();
     gifCtx.fillStyle = gradient;
-    gifCtx.fillRect(x, y, shapeWidth, shapeHeight);
+    gifCtx.fillRect(sweepX, y, shineWidth, shapeHeight);
+    gifCtx.restore();
   }
 
   const data = gifCtx.getImageData(0, 0, width, height).data;
@@ -510,7 +525,7 @@ function renderGifIndices(progress) {
 }
 
 function gifBlob() {
-  const frames = 16;
+  const frames = 24;
   const firstFrame = renderGifIndices(0);
   const bytes = [];
   pushString(bytes, "GIF89a");
