@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Skeleton Loader Creator</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Skeleton Loader Creator</h1>
+          <p>Turn image, SVG, or PDF layouts into animated skeleton placeholders.</p>
+        </div>
+      </header>
+
+      <section class="app-grid">
+        <aside class="panel controls">
+          <label class="drop-zone" for="fileInput" id="dropZone">
+            <input id="fileInput" type="file" accept="image/*,.svg,.pdf,application/pdf,image/svg+xml">
+            <span class="upload-icon" id="uploadIcon" aria-hidden="true">+</span>
+            <strong id="uploadTitle">Upload file</strong>
+            <small id="uploadHint">PNG, JPG, WebP, SVG, or PDF</small>
+            <em id="uploadStatus">Ready for upload</em>
+            <button class="icon-button remove-file" id="removeFileButton" type="button" aria-label="Remove uploaded file">&times;</button>
+          </label>
+
+          <div class="mode-switch" aria-label="Control mode">
+            <label><input type="radio" name="controlMode" value="simple" checked> Simple</label>
+            <label><input type="radio" name="controlMode" value="advanced"> Advanced</label>
+          </div>
+
+          <div class="control-row">
+            <div class="control-label">
+              <label for="threshold">Shape sensitivity</label>
+              <output id="thresholdValue">42</output>
+            </div>
+            <input id="threshold" type="range" min="12" max="90" value="42">
+          </div>
+
+          <div class="control-row">
+            <div class="control-label">
+              <label for="shapeLimit">Minimum shapes</label>
+              <output id="shapeLimitValue">60 boxes</output>
+            </div>
+            <input id="shapeLimit" type="range" min="4" max="160" value="60">
+          </div>
+
+          <div class="control-row compact">
+            <label for="radius">Corner radius</label>
+            <div class="number-input">
+              <input id="radius" type="number" min="0" max="48" value="8">
+              <span>px</span>
+            </div>
+          </div>
+
+          <label class="toggle-row">
+            <input id="useColor" type="checkbox">
+            <span>Use gray values as colored hues</span>
+          </label>
+
+          <div class="advanced-controls" id="advancedControls">
+            <div class="control-row compact">
+              <label for="targetSize">Output size</label>
+              <div class="number-input">
+                <input id="targetSize" type="number" min="0.1" max="10" step="0.1" value="1.0">
+                <span>MB</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats" aria-live="polite">
+            <span><b id="shapeCount">0</b> loader boxes</span>
+            <span id="fileName">No file loaded</span>
+          </div>
+        </aside>
+
+        <section class="preview-stack">
+          <article class="preview-pane">
+            <header>
+              <h2>Uploaded image</h2>
+            </header>
+            <div class="canvas-frame">
+              <canvas id="sourceCanvas" width="900" height="640"></canvas>
+              <p class="empty-state" id="sourceEmpty">Upload a file to preview it here.</p>
+            </div>
+          </article>
+
+          <article class="preview-pane">
+            <header>
+              <h2>Skeleton loader</h2>
+            </header>
+            <div class="canvas-frame">
+              <svg id="skeletonPreview" viewBox="0 0 900 640" role="img" aria-label="Generated skeleton preview"></svg>
+              <p class="empty-state" id="loaderEmpty">Skeleton output appears after upload.</p>
+            </div>
+          </article>
+        </section>
+
+        <aside class="panel export-card">
+          <h2>Export</h2>
+          <fieldset class="mode-group">
+            <legend>Export as</legend>
+            <label><input type="radio" name="exportMode" value="gif" checked> GIF</label>
+            <label><input type="radio" name="exportMode" value="lottie"> Lottie</label>
+          </fieldset>
+
+          <div class="control-row">
+            <label for="exportName">File name</label>
+            <input id="exportName" type="text" value="skeleton-loader">
+          </div>
+
+          <button class="button" id="downloadButton" type="button" disabled>Download GIF</button>
+          <p id="exportMeta">Upload a file to enable export.</p>
+        </aside>
+      </section>
+    </main>
+
+    <script src="app.js" type="module"></script>
+  </body>
+</html>
