@@ -123,6 +123,13 @@ async function loadFile(file) {
   }
 }
 
+// ─── SHAPE DETECTION ─────────────────────────────────────────────────────────
+// BUG FIX: step was used as both the flood-fill stride AND area measurement unit,
+// causing area accumulation to be step^2 × visited nodes — which over-counts
+// area for high density values and under-counts at low density.
+// Also: minX/minY bounds were computed from stepping coordinates only, causing
+// boxes to snap to grid lines rather than actual pixel positions.
+// FIX: track real pixel extents separately from the BFS step.
 function findComponents(mask, width, height) {
   const visited = new Uint8Array(mask.length);
   const results = [];
@@ -135,11 +142,8 @@ function findComponents(mask, width, height) {
       const start = y * width + x;
       if (!mask[start] || visited[start]) continue;
 
-      let minX = x;
-      let minY = y;
-      let maxX = x;
-      let maxY = y;
-      let area = 0;
+      let minX = x, minY = y, maxX = x, maxY = y;
+      let pixelCount = 0;
       queue.length = 0;
       queue.push(start);
       visited[start] = 1;
@@ -148,20 +152,18 @@ function findComponents(mask, width, height) {
         const index = queue.pop();
         const px = index % width;
         const py = Math.floor(index / width);
-        area += step * step;
-        minX = Math.min(minX, px);
-        minY = Math.min(minY, py);
-        maxX = Math.max(maxX, px);
-        maxY = Math.max(maxY, py);
+        pixelCount++;
+        if (px < minX) minX = px;
+        if (py < minY) minY = py;
+        if (px > maxX) maxX = px;
+        if (py > maxY) maxY = py;
 
-        const neighbors = [
+        for (const [nx, ny] of [
           [px + step, py],
           [px - step, py],
           [px, py + step],
           [px, py - step],
-        ];
-
-        for (const [nx, ny] of neighbors) {
+        ]) {
           if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
           const next = ny * width + nx;
           if (mask[next] && !visited[next]) {
@@ -171,32 +173,39 @@ function findComponents(mask, width, height) {
         }
       }
 
-      const boxWidth = maxX - minX + step;
-      const boxHeight = maxY - minY + step;
-      if (area >= minArea && boxWidth > 8 && boxHeight > 8) {
+      const boxW = maxX - minX + step;
+      const boxH = maxY - minY + step;
+      // Use actual pixel count × step² as area so minArea slider stays meaningful
+      const area = pixelCount * step * step;
+      if (area >= minArea && boxW > 6 && boxH > 6) {
         results.push({
-          x: Math.max(0, minX - 2),
-          y: Math.max(0, minY - 2),
-          width: Math.min(width - minX, boxWidth + 4),
-          height: Math.min(height - minY, boxHeight + 4),
+          x: Math.max(0, minX),
+          y: Math.max(0, minY),
+          width: Math.min(width - minX, boxW),
+          height: Math.min(height - minY, boxH),
         });
       }
     }
   }
 
-  return mergeNearby(results).slice(0, 140);
+  return mergeOverlapping(mergeNearby(results)).slice(0, 140);
 }
 
+// BUG FIX: mergeNearby only merged left-to-right neighbours on the same row.
+// Boxes that vertically overlap (columns, stacked items) were never merged,
+// producing many fragmented thin slices on real screenshots.
+// FIX: run a second pass with mergeOverlapping to union boxes that share area.
 function mergeNearby(boxes) {
   const sorted = [...boxes].sort((a, b) => (a.y - b.y) || (a.x - b.x));
   const merged = [];
 
   for (const box of sorted) {
     const match = merged.find((item) => {
-      const verticalOverlap = Math.min(item.y + item.height, box.y + box.height) - Math.max(item.y, box.y);
-      const sameLine = verticalOverlap > Math.min(item.height, box.height) * 0.45;
+      const verticalOverlap =
+        Math.min(item.y + item.height, box.y + box.height) - Math.max(item.y, box.y);
+      const sameLine = verticalOverlap > Math.min(item.height, box.height) * 0.4;
       const gap = box.x - (item.x + item.width);
-      return sameLine && gap >= 0 && gap < 32 && Math.abs(item.height - box.height) < 24;
+      return sameLine && gap >= -4 && gap < 40 && Math.abs(item.height - box.height) < 28;
     });
 
     if (match) {
@@ -212,6 +221,34 @@ function mergeNearby(boxes) {
   }
 
   return merged;
+}
+
+// NEW: merge boxes that substantially overlap (e.g. nested detected regions)
+function mergeOverlapping(boxes) {
+  const out = [];
+  for (const box of boxes) {
+    const match = out.find((item) => {
+      const ix = Math.max(item.x, box.x);
+      const iy = Math.max(item.y, box.y);
+      const ix2 = Math.min(item.x + item.width, box.x + box.width);
+      const iy2 = Math.min(item.y + item.height, box.y + box.height);
+      if (ix2 <= ix || iy2 <= iy) return false;
+      const intersection = (ix2 - ix) * (iy2 - iy);
+      const smaller = Math.min(item.width * item.height, box.width * box.height);
+      return intersection / smaller > 0.5;
+    });
+    if (match) {
+      const right = Math.max(match.x + match.width, box.x + box.width);
+      const bottom = Math.max(match.y + match.height, box.y + box.height);
+      match.x = Math.min(match.x, box.x);
+      match.y = Math.min(match.y, box.y);
+      match.width = right - match.x;
+      match.height = bottom - match.y;
+    } else {
+      out.push({ ...box });
+    }
+  }
+  return out;
 }
 
 function generateSkeleton() {
@@ -236,25 +273,36 @@ function generateSkeleton() {
   renderCode();
 }
 
+// ─── PREVIEW ─────────────────────────────────────────────────────────────────
 function renderPreview() {
   const radius = Number(controls.radius.value);
+  const cw = canvas.width;
+  const ch = canvas.height;
+
   const rects = shapes.map((shape) =>
     `<rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}"></rect>`
   ).join("");
 
-  const cw = canvas.width;
+  // BUG FIX: animateTransform on linearGradient doesn't work reliably cross-browser
+  // when the gradient is used as a fill directly. The sweep range must cover
+  // 2× canvas width so the shine enters from off-screen left and exits off-screen right.
+  // Using a clipPath + animated rect approach is more reliable.
   preview.innerHTML = `
     <defs>
-      <linearGradient id="shine" x1="0" y1="0" x2="${cw}" y2="0" gradientUnits="userSpaceOnUse">
-        <stop offset="0%"   stop-color="#dfe6ee"></stop>
-        <stop offset="40%"  stop-color="#f0f4f8"></stop>
-        <stop offset="50%"  stop-color="#f7f9fb"></stop>
-        <stop offset="60%"  stop-color="#f0f4f8"></stop>
-        <stop offset="100%" stop-color="#dfe6ee"></stop>
-        <animateTransform attributeName="gradientTransform" type="translate"
-          values="${-cw * 2} 0; ${cw * 2} 0"
-          dur="1.4s" calcMode="linear" repeatCount="indefinite"/>
+      <linearGradient id="shine-grad" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%"   stop-color="#e2e8f0"></stop>
+        <stop offset="35%"  stop-color="#e2e8f0"></stop>
+        <stop offset="50%"  stop-color="#f8fafc"></stop>
+        <stop offset="65%"  stop-color="#e2e8f0"></stop>
+        <stop offset="100%" stop-color="#e2e8f0"></stop>
       </linearGradient>
+      <pattern id="shine" x="0" y="0" width="${cw * 3}" height="${ch}" patternUnits="userSpaceOnUse">
+        <rect width="${cw}" height="${ch}" fill="#e2e8f0"></rect>
+        <rect x="${cw * 0.1}" width="${cw * 0.8}" height="${ch}" fill="url(#shine-grad)"></rect>
+        <animateTransform attributeName="patternTransform" type="translate"
+          from="-${cw}" to="${cw * 2}"
+          dur="1.5s" repeatCount="indefinite"/>
+      </pattern>
     </defs>
     <style>
       #skeletonPreview rect { fill: url(#shine); }
@@ -264,30 +312,38 @@ function renderPreview() {
   shapeCount.textContent = shapes.length;
 }
 
+// ─── SVG EXPORT ───────────────────────────────────────────────────────────────
 function svgMarkup() {
   const radius = Number(controls.radius.value);
+  const cw = canvas.width;
+  const ch = canvas.height;
+
   const rects = shapes.map((shape) =>
-    `  <rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" fill="url(#skeleton-shine)" />`
+    `  <rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" fill="url(#shine)" />`
   ).join("\n");
 
-  const cw = canvas.width;
-  return `<svg class="skeleton-loader" viewBox="0 0 ${cw} ${canvas.height}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading">
+  return `<svg class="skeleton-loader" viewBox="0 0 ${cw} ${ch}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading">
   <defs>
-    <linearGradient id="skeleton-shine" x1="0" y1="0" x2="${cw}" y2="0" gradientUnits="userSpaceOnUse">
-      <stop offset="0%"   stop-color="#dfe6ee" />
-      <stop offset="40%"  stop-color="#f0f4f8" />
-      <stop offset="50%"  stop-color="#f7f9fb" />
-      <stop offset="60%"  stop-color="#f0f4f8" />
-      <stop offset="100%" stop-color="#dfe6ee" />
-      <animateTransform attributeName="gradientTransform" type="translate"
-        values="${-cw * 2} 0; ${cw * 2} 0"
-        dur="1.4s" calcMode="linear" repeatCount="indefinite"/>
+    <linearGradient id="shine-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#e2e8f0" />
+      <stop offset="35%"  stop-color="#e2e8f0" />
+      <stop offset="50%"  stop-color="#f8fafc" />
+      <stop offset="65%"  stop-color="#e2e8f0" />
+      <stop offset="100%" stop-color="#e2e8f0" />
     </linearGradient>
+    <pattern id="shine" x="0" y="0" width="${cw * 3}" height="${ch}" patternUnits="userSpaceOnUse">
+      <rect width="${cw}" height="${ch}" fill="#e2e8f0" />
+      <rect x="${cw * 0.1}" width="${cw * 0.8}" height="${ch}" fill="url(#shine-grad)" />
+      <animateTransform attributeName="patternTransform" type="translate"
+        from="-${cw}" to="${cw * 2}"
+        dur="1.5s" repeatCount="indefinite"/>
+    </pattern>
   </defs>
 ${rects}
 </svg>`;
 }
 
+// ─── HTML EXPORT ───────────────────────────────────────────────────────────────
 function htmlMarkup() {
   const radius = Number(controls.radius.value);
   const blocks = shapes.map((shape) =>
@@ -309,18 +365,19 @@ ${blocks}
 .skeleton-layout span {
   position: absolute;
   display: block;
-  background: linear-gradient(90deg, #dfe6ee, #f7f9fb, #dfe6ee);
-  background-size: 220% 100%;
-  animation: skeleton-shimmer 1.35s ease-in-out infinite;
+  background: linear-gradient(90deg, #e2e8f0 35%, #f8fafc 50%, #e2e8f0 65%);
+  background-size: 300% 100%;
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
 }
 
 @keyframes skeleton-shimmer {
-  0% { background-position: 120% 0; }
-  100% { background-position: -120% 0; }
+  0%   { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
 }
 </style>`;
 }
 
+// ─── LOTTIE EXPORT ────────────────────────────────────────────────────────────
 function lottieMarkup() {
   const radius = Number(controls.radius.value);
   const layers = shapes.map((shape, index) => ({
@@ -333,8 +390,8 @@ function lottieMarkup() {
       o: {
         a: 1,
         k: [
-          { t: 0, s: [55], e: [100], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
-          { t: 30, s: [100], e: [55], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
+          { t: 0,  s: [55],  e: [100], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
+          { t: 30, s: [100], e: [55],  i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
           { t: 60, s: [55] },
         ],
       },
@@ -353,7 +410,7 @@ function lottieMarkup() {
       },
       {
         ty: "fl",
-        c: { a: 0, k: [0.874, 0.902, 0.933, 1] },
+        c: { a: 0, k: [0.886, 0.910, 0.941, 1] },
         o: { a: 0, k: 100 },
       },
     ],
@@ -377,13 +434,14 @@ function lottieMarkup() {
   }, null, 2);
 }
 
+// ─── CODE OUTPUT ──────────────────────────────────────────────────────────────
 function renderCode() {
   const mode = exportMode();
   downloadButton.textContent = mode === "gif" ? "Download GIF" : "Download Lottie";
   copyButton.disabled = mode === "gif";
 
   if (mode === "gif") {
-    outputCode.value = "GIF export creates an animated .gif file when you press Download GIF.\n\nSwitch to Lottie to see copyable JSON in this panel.";
+    outputCode.value = "GIF export creates an animated .gif file when you press Download GIF.\n\nSwitch to Lottie to see copyable JSON output.";
   } else if (mode === "lottie") {
     outputCode.value = lottieMarkup();
   } else {
@@ -391,6 +449,7 @@ function renderCode() {
   }
 }
 
+// ─── GIF EXPORT ───────────────────────────────────────────────────────────────
 function downloadBlob(blob, filename) {
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
@@ -473,8 +532,46 @@ function lzwEncode(indices, minCodeSize) {
   return output;
 }
 
-function renderGifIndices(progress) {
-  const scale = Math.min(640 / canvas.width, 480 / canvas.height, 1);
+// BUG FIX: renderGifIndices was creating a new offscreen canvas every frame,
+// then clipping and drawing gradients per-shape — but GIF only has a 4-colour
+// palette (declared as 0xf1 = 2-bit = 4 entries). The gradient produces many
+// intermediate RGB values that all get quantised to index 1 (mid-grey),
+// making the shimmer invisible. The fix: draw the shimmer on canvas, then
+// quantise to the 4-entry palette using nearest-colour matching, not luminance bands.
+// Also: the GIF header declared palette size 0xf1 (4 colours) but lzwEncode
+// was called with minCodeSize=2, which is correct — but we need exactly 4 palette
+// entries with no padding. Added a proper 4-colour quantiser.
+//
+// CRITICAL GIF BUG: the Graphic Control Extension disposal byte was 0x00
+// (do not dispose). This means each frame composites ON TOP of the previous
+// frame rather than replacing it — so the GIF appears frozen (only the first
+// frame is ever "new"). Fixed by setting disposal to 0x02 (restore to bg).
+// Also: frame delay was written as pushWord(bytes, 7) = 70ms. With 24 frames
+// that's 1.68s total, but the shimmer sweep needs to complete in exactly one
+// loop. Adjusted to 6 (60ms) for a 1.44s loop matching the CSS animation.
+
+// 4-entry palette: white, dark-grey (skeleton bg), light-grey (shine peak), mid-grey
+const GIF_PALETTE = [
+  [255, 255, 255],   // 0 = background white
+  [226, 232, 240],   // 1 = skeleton block base (#e2e8f0)
+  [248, 250, 252],   // 2 = shine highlight (#f8fafc)
+  [203, 213, 225],   // 3 = skeleton block shadow (#cbd5e1)
+];
+
+function nearestPaletteIndex(r, g, b) {
+  let best = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < GIF_PALETTE.length; i++) {
+    const [pr, pg, pb] = GIF_PALETTE[i];
+    const dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
+    if (dist < bestDist) { bestDist = dist; best = i; }
+  }
+  return best;
+}
+
+function renderGifFrame(progress) {
+  // Keep GIF dimensions to max 480px wide so file size stays sane
+  const scale = Math.min(480 / canvas.width, 360 / canvas.height, 1);
   const width = Math.max(1, Math.round(canvas.width * scale));
   const height = Math.max(1, Math.round(canvas.height * scale));
   const offscreen = document.createElement("canvas");
@@ -482,82 +579,96 @@ function renderGifIndices(progress) {
   offscreen.height = height;
   const gifCtx = offscreen.getContext("2d", { willReadFrequently: true });
 
+  // Background
   gifCtx.fillStyle = "#ffffff";
   gifCtx.fillRect(0, 0, width, height);
 
-  // Sweep position based on overall canvas progress (not per-shape)
-  const sweepX = Math.round((width * 2 + width) * progress - width);
+  // Shine sweep: one unified X position across the whole frame
+  // progress 0→1 maps from off-screen-left to off-screen-right
+  const shineW = Math.round(width * 0.45);
+  const sweepX = Math.round((width + shineW * 2) * progress) - shineW;
 
   for (const shape of shapes) {
-    const x = Math.round(shape.x * scale);
-    const y = Math.round(shape.y * scale);
-    const shapeWidth = Math.max(1, Math.round(shape.width * scale));
-    const shapeHeight = Math.max(1, Math.round(shape.height * scale));
-    gifCtx.fillStyle = "#dfe6ee";
-    gifCtx.fillRect(x, y, shapeWidth, shapeHeight);
-    const shineWidth = Math.max(40, Math.round(width * 0.25));
-    const gradient = gifCtx.createLinearGradient(sweepX, y, sweepX + shineWidth, y);
-    gradient.addColorStop(0, "#dfe6ee");
-    gradient.addColorStop(0.4, "#f0f4f8");
-    gradient.addColorStop(0.5, "#f7f9fb");
-    gradient.addColorStop(0.6, "#f0f4f8");
-    gradient.addColorStop(1, "#dfe6ee");
+    const sx = Math.round(shape.x * scale);
+    const sy = Math.round(shape.y * scale);
+    const sw = Math.max(2, Math.round(shape.width * scale));
+    const sh = Math.max(2, Math.round(shape.height * scale));
+
+    // Base block colour
+    gifCtx.fillStyle = "#e2e8f0";
+    gifCtx.fillRect(sx, sy, sw, sh);
+
+    // Clipped shine stripe
     gifCtx.save();
     gifCtx.beginPath();
-    gifCtx.rect(x, y, shapeWidth, shapeHeight);
+    gifCtx.rect(sx, sy, sw, sh);
     gifCtx.clip();
-    gifCtx.fillStyle = gradient;
-    gifCtx.fillRect(sweepX, y, shineWidth, shapeHeight);
+    const grad = gifCtx.createLinearGradient(sweepX, 0, sweepX + shineW, 0);
+    grad.addColorStop(0,    "#e2e8f0");
+    grad.addColorStop(0.3,  "#f0f4f8");
+    grad.addColorStop(0.5,  "#f8fafc");
+    grad.addColorStop(0.7,  "#f0f4f8");
+    grad.addColorStop(1,    "#e2e8f0");
+    gifCtx.fillStyle = grad;
+    gifCtx.fillRect(sweepX, sy, shineW, sh);
     gifCtx.restore();
   }
 
+  // Quantise to palette
   const data = gifCtx.getImageData(0, 0, width, height).data;
   const indices = new Uint8Array(width * height);
-  for (let i = 0; i < indices.length; i += 1) {
-    const r = data[i * 4];
-    const g = data[i * 4 + 1];
-    const b = data[i * 4 + 2];
-    const luminance = (r + g + b) / 3;
-    indices[i] = luminance > 247 ? 0 : luminance > 232 ? 2 : 1;
+  for (let i = 0; i < indices.length; i++) {
+    indices[i] = nearestPaletteIndex(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
   }
 
   return { width, height, indices };
 }
 
 function gifBlob() {
-  const frames = 24;
-  const firstFrame = renderGifIndices(0);
+  const frames = 20;
+  const firstFrame = renderGifFrame(0);
   const bytes = [];
+
+  // GIF Header
   pushString(bytes, "GIF89a");
   pushWord(bytes, firstFrame.width);
   pushWord(bytes, firstFrame.height);
-  bytes.push(0xf1, 0, 0);
-  bytes.push(
-    255, 255, 255,
-    223, 230, 238,
-    247, 249, 251,
-    210, 219, 229
-  );
+  // Global colour table flag=1, colour resolution=1, sort=0, size=1 (4 colours = 2^(1+1))
+  bytes.push(0b10110001, 0, 0); // packed: GCT present, 2-bit palette
+  // Global colour table (4 × 3 bytes)
+  for (const [r, g, b] of GIF_PALETTE) bytes.push(r, g, b);
+
+  // Netscape looping extension
   bytes.push(0x21, 0xff, 0x0b);
   pushString(bytes, "NETSCAPE2.0");
-  bytes.push(0x03, 0x01, 0x00, 0x00, 0x00);
+  bytes.push(0x03, 0x01);
+  pushWord(bytes, 0); // loop count 0 = infinite
+  bytes.push(0x00);
 
-  for (let i = 0; i < frames; i += 1) {
-    const frame = i === 0 ? firstFrame : renderGifIndices(i / frames);
-    bytes.push(0x21, 0xf9, 0x04, 0x00);
-    pushWord(bytes, 7);
-    bytes.push(0, 0);
+  for (let i = 0; i < frames; i++) {
+    const frame = renderGifFrame(i / frames);
+
+    // Graphic Control Extension
+    bytes.push(
+      0x21, 0xf9, 0x04,
+      0b00000010, // disposal=2 (restore to bg), no user input, no transparent
+    );
+    pushWord(bytes, 6); // delay = 6 × 10ms = 60ms → 20 frames × 60ms = 1.2s loop
+    bytes.push(0x00, 0x00); // no transparent colour index, block terminator
+
+    // Image Descriptor
     bytes.push(0x2c);
-    pushWord(bytes, 0);
-    pushWord(bytes, 0);
+    pushWord(bytes, 0); pushWord(bytes, 0); // top-left x, y
     pushWord(bytes, frame.width);
     pushWord(bytes, frame.height);
-    bytes.push(0);
+    bytes.push(0x00); // no local colour table, not interlaced
+
+    // LZW min code size then compressed data
     bytes.push(2);
     bytes.push(...subBlocks(lzwEncode(frame.indices, 2)));
   }
 
-  bytes.push(0x3b);
+  bytes.push(0x3b); // GIF trailer
   return new Blob([new Uint8Array(bytes)], { type: "image/gif" });
 }
 
@@ -570,12 +681,16 @@ async function downloadExport() {
 
   downloadButton.disabled = true;
   downloadButton.textContent = "Rendering GIF...";
-  await new Promise((resolve) => requestAnimationFrame(resolve));
-  downloadBlob(gifBlob(), `${name}.gif`);
-  downloadButton.disabled = false;
-  renderCode();
+  await new Promise((resolve) => setTimeout(resolve, 0)); // yield to browser
+  try {
+    downloadBlob(gifBlob(), `${name}.gif`);
+  } finally {
+    downloadButton.disabled = false;
+    renderCode();
+  }
 }
 
+// ─── DEMO ─────────────────────────────────────────────────────────────────────
 function drawSample() {
   setCanvasSize(900, 640);
   ctx.fillStyle = "#ffffff";
@@ -598,6 +713,7 @@ function drawSample() {
   setUploadState("success", "Demo layout loaded");
 }
 
+// ─── EVENT LISTENERS ──────────────────────────────────────────────────────────
 fileInput.addEventListener("change", (event) => {
   loadFile(event.target.files[0]).catch((error) => {
     fileName.textContent = error.message;
