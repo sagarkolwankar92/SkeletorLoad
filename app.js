@@ -1,53 +1,88 @@
 const canvas = document.querySelector("#sourceCanvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const preview = document.querySelector("#skeletonPreview");
-const outputCode = document.querySelector("#outputCode");
 const fileInput = document.querySelector("#fileInput");
 const shapeCount = document.querySelector("#shapeCount");
 const fileName = document.querySelector("#fileName");
-const dropZone = document.querySelector(".drop-zone");
+const dropZone = document.querySelector("#dropZone");
 const uploadIcon = document.querySelector("#uploadIcon");
+const uploadTitle = document.querySelector("#uploadTitle");
+const uploadHint = document.querySelector("#uploadHint");
 const uploadStatus = document.querySelector("#uploadStatus");
+const removeFileButton = document.querySelector("#removeFileButton");
+const sourceEmpty = document.querySelector("#sourceEmpty");
+const loaderEmpty = document.querySelector("#loaderEmpty");
 const downloadButton = document.querySelector("#downloadButton");
-const copyButton = document.querySelector("#copyButton");
+const exportName = document.querySelector("#exportName");
+const exportMeta = document.querySelector("#exportMeta");
+const advancedControls = document.querySelector("#advancedControls");
 
 const controls = {
   threshold: document.querySelector("#threshold"),
-  minArea: document.querySelector("#minArea"),
+  shapeLimit: document.querySelector("#shapeLimit"),
   radius: document.querySelector("#radius"),
-  density: document.querySelector("#density"),
+  useColor: document.querySelector("#useColor"),
+  targetSize: document.querySelector("#targetSize"),
+};
+
+const outputs = {
+  threshold: document.querySelector("#thresholdValue"),
+  shapeLimit: document.querySelector("#shapeLimitValue"),
 };
 
 let currentImage = null;
-let currentName = "sample-layout";
+let currentName = "skeleton-loader";
 let shapes = [];
-
-const escapeHtml = (value) =>
-  value.replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;",
-  })[char]);
+let sourcePixels = null;
 
 function exportMode() {
   return document.querySelector("input[name='exportMode']:checked").value;
 }
 
+function controlMode() {
+  return document.querySelector("input[name='controlMode']:checked").value;
+}
+
+function safeFileName(value) {
+  return (value || "skeleton-loader")
+    .trim()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9-_]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    || "skeleton-loader";
+}
+
 function setUploadState(state, message) {
+  const hasFile = state === "success";
   dropZone.classList.toggle("is-loading", state === "loading");
-  dropZone.classList.toggle("is-success", state === "success");
-  uploadIcon.textContent = state === "success" ? "✓" : "+";
+  dropZone.classList.toggle("has-file", hasFile);
+  uploadIcon.textContent = hasFile ? "OK" : "+";
+  uploadTitle.textContent = hasFile ? currentName : "Upload file";
+  uploadHint.textContent = hasFile ? "Click the X to remove it" : "PNG, JPG, WebP, SVG, or PDF";
   uploadStatus.textContent = message;
 }
 
+function setEmptyState(isEmpty) {
+  sourceEmpty.classList.toggle("is-hidden", !isEmpty);
+  loaderEmpty.classList.toggle("is-hidden", !isEmpty);
+  downloadButton.disabled = isEmpty;
+}
+
+function updateControlLabels() {
+  outputs.threshold.textContent = controls.threshold.value;
+  outputs.shapeLimit.textContent = `${controls.shapeLimit.value} boxes`;
+  advancedControls.classList.toggle("is-visible", controlMode() === "advanced");
+}
+
 function setCanvasSize(width, height) {
-  const maxWidth = 1000;
-  const maxHeight = 720;
+  const maxWidth = 1100;
+  const maxHeight = 760;
   const scale = Math.min(maxWidth / width, maxHeight / height, 1);
   canvas.width = Math.max(320, Math.round(width * scale));
   canvas.height = Math.max(220, Math.round(height * scale));
+  document.querySelectorAll(".canvas-frame").forEach((frame) => {
+    frame.style.setProperty("--preview-aspect", `${canvas.width} / ${canvas.height}`);
+  });
   preview.setAttribute("viewBox", `0 0 ${canvas.width} ${canvas.height}`);
 }
 
@@ -57,7 +92,24 @@ function drawCurrentImage() {
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(currentImage, 0, 0, canvas.width, canvas.height);
+  sourcePixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
   generateSkeleton();
+}
+
+function clearFile() {
+  currentImage = null;
+  sourcePixels = null;
+  shapes = [];
+  fileInput.value = "";
+  currentName = "skeleton-loader";
+  exportName.value = currentName;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  preview.innerHTML = "";
+  shapeCount.textContent = "0";
+  fileName.textContent = "No file loaded";
+  exportMeta.textContent = "Upload a file to enable export.";
+  setEmptyState(true);
+  setUploadState("ready", "Ready for upload");
 }
 
 function loadImageFromUrl(url, name = "uploaded-file") {
@@ -65,7 +117,8 @@ function loadImageFromUrl(url, name = "uploaded-file") {
     const image = new Image();
     image.onload = () => {
       currentImage = image;
-      currentName = name.replace(/\.[^.]+$/, "") || "skeleton-loader";
+      currentName = safeFileName(name);
+      exportName.value = currentName;
       setCanvasSize(image.naturalWidth || image.width, image.naturalHeight || image.height);
       drawCurrentImage();
       resolve();
@@ -115,26 +168,79 @@ async function loadFile(file) {
       await loadRaster(file);
     }
     fileName.textContent = file.name;
-    setUploadState("success", `Uploaded ${file.name}`);
+    setUploadState("success", file.name);
+    setEmptyState(false);
+    renderExportMeta();
   } catch (error) {
     fileName.textContent = error.message;
     setUploadState("ready", "Upload failed");
+    setEmptyState(!currentImage);
     throw error;
   }
 }
 
-// ─── SHAPE DETECTION ─────────────────────────────────────────────────────────
-// BUG FIX: step was used as both the flood-fill stride AND area measurement unit,
-// causing area accumulation to be step^2 × visited nodes — which over-counts
-// area for high density values and under-counts at low density.
-// Also: minX/minY bounds were computed from stepping coordinates only, causing
-// boxes to snap to grid lines rather than actual pixel positions.
-// FIX: track real pixel extents separately from the BFS step.
+function shapeColor(shape) {
+  if (!sourcePixels) {
+    return { fill: "#e2e8f0", shine: "#f8fafc", palette: [226, 232, 240] };
+  }
+
+  const data = sourcePixels.data;
+  const startX = Math.max(0, Math.floor(shape.x));
+  const startY = Math.max(0, Math.floor(shape.y));
+  const endX = Math.min(sourcePixels.width, Math.ceil(shape.x + shape.width));
+  const endY = Math.min(sourcePixels.height, Math.ceil(shape.y + shape.height));
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let count = 0;
+
+  for (let y = startY; y < endY; y += 2) {
+    for (let x = startX; x < endX; x += 2) {
+      const index = (y * sourcePixels.width + x) * 4;
+      r += data[index];
+      g += data[index + 1];
+      b += data[index + 2];
+      count += 1;
+    }
+  }
+
+  if (!count) return { fill: "#e2e8f0", shine: "#f8fafc", palette: [226, 232, 240] };
+  r = Math.round(r / count);
+  g = Math.round(g / count);
+  b = Math.round(b / count);
+
+  if (!controls.useColor.checked) {
+    const gray = Math.round(210 + ((r + g + b) / 3 / 255) * 24);
+    return {
+      fill: `rgb(${gray}, ${gray + 4}, ${gray + 10})`,
+      shine: "#f8fafc",
+      palette: [gray, Math.min(255, gray + 4), Math.min(255, gray + 10)],
+    };
+  }
+
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const luminance = (r + g + b) / 3;
+  let hue = (luminance / 255) * 300;
+
+  if (max !== min) {
+    if (max === r) hue = (60 * ((g - b) / (max - min)) + 360) % 360;
+    if (max === g) hue = 60 * ((b - r) / (max - min)) + 120;
+    if (max === b) hue = 60 * ((r - g) / (max - min)) + 240;
+  }
+
+  return {
+    fill: `hsl(${Math.round(hue)}, 42%, 82%)`,
+    shine: `hsl(${Math.round(hue)}, 70%, 96%)`,
+    palette: [r, g, b],
+  };
+}
+
 function findComponents(mask, width, height) {
   const visited = new Uint8Array(mask.length);
   const results = [];
-  const step = Number(controls.density.value);
-  const minArea = Number(controls.minArea.value);
+  const step = controlMode() === "advanced" ? 2 : 4;
+  const minArea = controlMode() === "advanced" ? 12 : 32;
   const queue = [];
 
   for (let y = 0; y < height; y += step) {
@@ -142,7 +248,10 @@ function findComponents(mask, width, height) {
       const start = y * width + x;
       if (!mask[start] || visited[start]) continue;
 
-      let minX = x, minY = y, maxX = x, maxY = y;
+      let minX = x;
+      let minY = y;
+      let maxX = x;
+      let maxY = y;
       let pixelCount = 0;
       queue.length = 0;
       queue.push(start);
@@ -152,18 +261,20 @@ function findComponents(mask, width, height) {
         const index = queue.pop();
         const px = index % width;
         const py = Math.floor(index / width);
-        pixelCount++;
-        if (px < minX) minX = px;
-        if (py < minY) minY = py;
-        if (px > maxX) maxX = px;
-        if (py > maxY) maxY = py;
+        pixelCount += 1;
+        minX = Math.min(minX, px);
+        minY = Math.min(minY, py);
+        maxX = Math.max(maxX, px);
+        maxY = Math.max(maxY, py);
 
-        for (const [nx, ny] of [
+        const neighbors = [
           [px + step, py],
           [px - step, py],
           [px, py + step],
           [px, py - step],
-        ]) {
+        ];
+
+        for (const [nx, ny] of neighbors) {
           if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
           const next = ny * width + nx;
           if (mask[next] && !visited[next]) {
@@ -173,36 +284,35 @@ function findComponents(mask, width, height) {
         }
       }
 
-      const boxW = maxX - minX + step;
-      const boxH = maxY - minY + step;
-      // Use actual pixel count × step² as area so minArea slider stays meaningful
+      const boxWidth = maxX - minX + step;
+      const boxHeight = maxY - minY + step;
       const area = pixelCount * step * step;
-      if (area >= minArea && boxW > 6 && boxH > 6) {
+      if (area >= minArea && boxWidth > 6 && boxHeight > 6) {
         results.push({
           x: Math.max(0, minX),
           y: Math.max(0, minY),
-          width: Math.min(width - minX, boxW),
-          height: Math.min(height - minY, boxH),
+          width: Math.min(width - minX, boxWidth),
+          height: Math.min(height - minY, boxHeight),
+          area,
         });
       }
     }
   }
 
-  return mergeOverlapping(mergeNearby(results)).slice(0, 140);
+  const limit = Number(controls.shapeLimit.value);
+  return mergeOverlapping(mergeNearby(results))
+    .sort((a, b) => b.area - a.area)
+    .slice(0, limit)
+    .sort((a, b) => (a.y - b.y) || (a.x - b.x));
 }
 
-// BUG FIX: mergeNearby only merged left-to-right neighbours on the same row.
-// Boxes that vertically overlap (columns, stacked items) were never merged,
-// producing many fragmented thin slices on real screenshots.
-// FIX: run a second pass with mergeOverlapping to union boxes that share area.
 function mergeNearby(boxes) {
   const sorted = [...boxes].sort((a, b) => (a.y - b.y) || (a.x - b.x));
   const merged = [];
 
   for (const box of sorted) {
     const match = merged.find((item) => {
-      const verticalOverlap =
-        Math.min(item.y + item.height, box.y + box.height) - Math.max(item.y, box.y);
+      const verticalOverlap = Math.min(item.y + item.height, box.y + box.height) - Math.max(item.y, box.y);
       const sameLine = verticalOverlap > Math.min(item.height, box.height) * 0.4;
       const gap = box.x - (item.x + item.width);
       return sameLine && gap >= -4 && gap < 40 && Math.abs(item.height - box.height) < 28;
@@ -215,6 +325,7 @@ function mergeNearby(boxes) {
       match.y = Math.min(match.y, box.y);
       match.width = right - match.x;
       match.height = bottom - match.y;
+      match.area = match.width * match.height;
     } else {
       merged.push({ ...box });
     }
@@ -223,20 +334,21 @@ function mergeNearby(boxes) {
   return merged;
 }
 
-// NEW: merge boxes that substantially overlap (e.g. nested detected regions)
 function mergeOverlapping(boxes) {
-  const out = [];
+  const merged = [];
+
   for (const box of boxes) {
-    const match = out.find((item) => {
-      const ix = Math.max(item.x, box.x);
-      const iy = Math.max(item.y, box.y);
-      const ix2 = Math.min(item.x + item.width, box.x + box.width);
-      const iy2 = Math.min(item.y + item.height, box.y + box.height);
-      if (ix2 <= ix || iy2 <= iy) return false;
-      const intersection = (ix2 - ix) * (iy2 - iy);
+    const match = merged.find((item) => {
+      const left = Math.max(item.x, box.x);
+      const top = Math.max(item.y, box.y);
+      const right = Math.min(item.x + item.width, box.x + box.width);
+      const bottom = Math.min(item.y + item.height, box.y + box.height);
+      if (right <= left || bottom <= top) return false;
+      const intersection = (right - left) * (bottom - top);
       const smaller = Math.min(item.width * item.height, box.width * box.height);
       return intersection / smaller > 0.5;
     });
+
     if (match) {
       const right = Math.max(match.x + match.width, box.x + box.width);
       const bottom = Math.max(match.y + match.height, box.y + box.height);
@@ -244,17 +356,19 @@ function mergeOverlapping(boxes) {
       match.y = Math.min(match.y, box.y);
       match.width = right - match.x;
       match.height = bottom - match.y;
+      match.area = match.width * match.height;
     } else {
-      out.push({ ...box });
+      merged.push({ ...box });
     }
   }
-  return out;
+
+  return merged;
 }
 
 function generateSkeleton() {
+  if (!currentImage || !sourcePixels) return;
   const { width, height } = canvas;
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const data = imageData.data;
+  const data = sourcePixels.data;
   const threshold = Number(controls.threshold.value);
   const mask = new Uint8Array(width * height);
 
@@ -268,118 +382,69 @@ function generateSkeleton() {
     if (contrast > threshold) mask[i / 4] = 1;
   }
 
-  shapes = findComponents(mask, width, height);
+  shapes = findComponents(mask, width, height).map((shape) => ({
+    ...shape,
+    color: shapeColor(shape),
+  }));
   renderPreview();
-  renderCode();
+  renderExportMeta();
 }
 
-// ─── PREVIEW ─────────────────────────────────────────────────────────────────
+function gradientDef(shape, index) {
+  if (!controls.useColor.checked) return "";
+  return `
+      <linearGradient id="shine-${index}" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="${shape.color.fill}"></stop>
+        <stop offset="50%" stop-color="${shape.color.shine}"></stop>
+        <stop offset="100%" stop-color="${shape.color.fill}"></stop>
+      </linearGradient>`;
+}
+
 function renderPreview() {
-  const radius = Number(controls.radius.value);
-  const cw = canvas.width;
-  const ch = canvas.height;
+  const radius = Math.max(0, Number(controls.radius.value) || 0);
+  const canvasWidth = canvas.width;
+  const canvasHeight = canvas.height;
+  const gradients = shapes.map(gradientDef).join("");
+  const rects = shapes.map((shape, index) => {
+    const fill = controls.useColor.checked ? `url(#shine-${index})` : "url(#shine)";
+    return `<rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" fill="${fill}"></rect>`;
+  }).join("");
 
-  const rects = shapes.map((shape) =>
-    `<rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}"></rect>`
-  ).join("");
-
-  // BUG FIX: animateTransform on linearGradient doesn't work reliably cross-browser
-  // when the gradient is used as a fill directly. The sweep range must cover
-  // 2× canvas width so the shine enters from off-screen left and exits off-screen right.
-  // Using a clipPath + animated rect approach is more reliable.
   preview.innerHTML = `
     <defs>
       <linearGradient id="shine-grad" x1="0" y1="0" x2="1" y2="0">
-        <stop offset="0%"   stop-color="#e2e8f0"></stop>
-        <stop offset="35%"  stop-color="#e2e8f0"></stop>
-        <stop offset="50%"  stop-color="#f8fafc"></stop>
-        <stop offset="65%"  stop-color="#e2e8f0"></stop>
+        <stop offset="0%" stop-color="#e2e8f0"></stop>
+        <stop offset="35%" stop-color="#e2e8f0"></stop>
+        <stop offset="50%" stop-color="#f8fafc"></stop>
+        <stop offset="65%" stop-color="#e2e8f0"></stop>
         <stop offset="100%" stop-color="#e2e8f0"></stop>
       </linearGradient>
-      <pattern id="shine" x="0" y="0" width="${cw * 3}" height="${ch}" patternUnits="userSpaceOnUse">
-        <rect width="${cw}" height="${ch}" fill="#e2e8f0"></rect>
-        <rect x="${cw * 0.1}" width="${cw * 0.8}" height="${ch}" fill="url(#shine-grad)"></rect>
+      <pattern id="shine" x="0" y="0" width="${canvasWidth * 3}" height="${canvasHeight}" patternUnits="userSpaceOnUse">
+        <rect width="${canvasWidth}" height="${canvasHeight}" fill="#e2e8f0"></rect>
+        <rect x="${canvasWidth * 0.1}" width="${canvasWidth * 0.8}" height="${canvasHeight}" fill="url(#shine-grad)"></rect>
         <animateTransform attributeName="patternTransform" type="translate"
-          from="-${cw}" to="${cw * 2}"
-          dur="1.5s" repeatCount="indefinite"/>
+          from="-${canvasWidth}" to="${canvasWidth * 2}"
+          dur="1.5s" repeatCount="indefinite"></animateTransform>
       </pattern>
+      ${gradients}
     </defs>
     <style>
-      #skeletonPreview rect { fill: url(#shine); }
+      #skeletonPreview rect { animation: loader-pulse 1.5s ease-in-out infinite; }
+      @keyframes loader-pulse { 0%, 100% { opacity: .8; } 50% { opacity: 1; } }
     </style>
     ${rects}
   `;
   shapeCount.textContent = shapes.length;
 }
 
-// ─── SVG EXPORT ───────────────────────────────────────────────────────────────
-function svgMarkup() {
-  const radius = Number(controls.radius.value);
-  const cw = canvas.width;
-  const ch = canvas.height;
-
-  const rects = shapes.map((shape) =>
-    `  <rect x="${shape.x}" y="${shape.y}" width="${shape.width}" height="${shape.height}" rx="${Math.min(radius, shape.height / 2)}" fill="url(#shine)" />`
-  ).join("\n");
-
-  return `<svg class="skeleton-loader" viewBox="0 0 ${cw} ${ch}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading">
-  <defs>
-    <linearGradient id="shine-grad" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%"   stop-color="#e2e8f0" />
-      <stop offset="35%"  stop-color="#e2e8f0" />
-      <stop offset="50%"  stop-color="#f8fafc" />
-      <stop offset="65%"  stop-color="#e2e8f0" />
-      <stop offset="100%" stop-color="#e2e8f0" />
-    </linearGradient>
-    <pattern id="shine" x="0" y="0" width="${cw * 3}" height="${ch}" patternUnits="userSpaceOnUse">
-      <rect width="${cw}" height="${ch}" fill="#e2e8f0" />
-      <rect x="${cw * 0.1}" width="${cw * 0.8}" height="${ch}" fill="url(#shine-grad)" />
-      <animateTransform attributeName="patternTransform" type="translate"
-        from="-${cw}" to="${cw * 2}"
-        dur="1.5s" repeatCount="indefinite"/>
-    </pattern>
-  </defs>
-${rects}
-</svg>`;
+function lottieColor(shape) {
+  if (!controls.useColor.checked) return [0.886, 0.91, 0.941, 1];
+  const [r, g, b] = shape.color.palette;
+  return [r / 255, g / 255, b / 255, 1];
 }
 
-// ─── HTML EXPORT ───────────────────────────────────────────────────────────────
-function htmlMarkup() {
-  const radius = Number(controls.radius.value);
-  const blocks = shapes.map((shape) =>
-    `  <span style="left:${shape.x}px;top:${shape.y}px;width:${shape.width}px;height:${shape.height}px;border-radius:${Math.min(radius, shape.height / 2)}px"></span>`
-  ).join("\n");
-
-  return `<div class="skeleton-layout" aria-label="Loading">
-${blocks}
-</div>
-
-<style>
-.skeleton-layout {
-  position: relative;
-  width: ${canvas.width}px;
-  max-width: 100%;
-  aspect-ratio: ${canvas.width} / ${canvas.height};
-}
-
-.skeleton-layout span {
-  position: absolute;
-  display: block;
-  background: linear-gradient(90deg, #e2e8f0 35%, #f8fafc 50%, #e2e8f0 65%);
-  background-size: 300% 100%;
-  animation: skeleton-shimmer 1.5s ease-in-out infinite;
-}
-
-@keyframes skeleton-shimmer {
-  0%   { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
-}
-</style>`;
-}
-
-// ─── LOTTIE EXPORT ────────────────────────────────────────────────────────────
 function lottieMarkup() {
-  const radius = Number(controls.radius.value);
+  const radius = Math.max(0, Number(controls.radius.value) || 0);
   const layers = shapes.map((shape, index) => ({
     ddd: 0,
     ind: index + 1,
@@ -390,8 +455,8 @@ function lottieMarkup() {
       o: {
         a: 1,
         k: [
-          { t: 0,  s: [55],  e: [100], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
-          { t: 30, s: [100], e: [55],  i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
+          { t: 0, s: [55], e: [100], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
+          { t: 30, s: [100], e: [55], i: { x: [0.42], y: [1] }, o: { x: [0.58], y: [0] } },
           { t: 60, s: [55] },
         ],
       },
@@ -410,7 +475,7 @@ function lottieMarkup() {
       },
       {
         ty: "fl",
-        c: { a: 0, k: [0.886, 0.910, 0.941, 1] },
+        c: { a: 0, k: lottieColor(shape) },
         o: { a: 0, k: 100 },
       },
     ],
@@ -427,29 +492,25 @@ function lottieMarkup() {
     op: 60,
     w: canvas.width,
     h: canvas.height,
-    nm: `${currentName || "skeleton-loader"} lottie`,
+    nm: `${safeFileName(exportName.value)} lottie`,
     ddd: 0,
     assets: [],
     layers,
   }, null, 2);
 }
 
-// ─── CODE OUTPUT ──────────────────────────────────────────────────────────────
-function renderCode() {
+function renderExportMeta(extra = "") {
   const mode = exportMode();
   downloadButton.textContent = mode === "gif" ? "Download GIF" : "Download Lottie";
-  copyButton.disabled = mode === "gif";
-
-  if (mode === "gif") {
-    outputCode.value = "GIF export creates an animated .gif file when you press Download GIF.\n\nSwitch to Lottie to see copyable JSON output.";
-  } else if (mode === "lottie") {
-    outputCode.value = lottieMarkup();
-  } else {
-    outputCode.value = svgMarkup();
+  downloadButton.disabled = !currentImage;
+  if (!currentImage) {
+    exportMeta.textContent = "Upload a file to enable export.";
+    return;
   }
+  const targetMb = Math.max(0.1, Number(controls.targetSize.value) || 1);
+  exportMeta.textContent = extra || `${shapes.length} boxes. Target GIF size around ${targetMb.toFixed(1)} MB.`;
 }
 
-// ─── GIF EXPORT ───────────────────────────────────────────────────────────────
 function downloadBlob(blob, filename) {
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
@@ -476,59 +537,56 @@ function subBlocks(bytes) {
   return blocks;
 }
 
-// ── GIF LZW encoder ────────────────────────────────────────────────────────
-// Uses a flat hash table keyed by (prefix_code << 8 | suffix_byte) so keys
-// are always unique integers — no string concatenation, no ambiguity.
 function lzwEncode(indices, minCodeSize) {
-  const CLEAR = 1 << minCodeSize;
-  const EOI   = CLEAR + 1;
-  const MAX_CODE = 4096;
-
+  const clear = 1 << minCodeSize;
+  const end = clear + 1;
+  const maxCode = 4096;
   const output = [];
-  let bitBuf = 0, bitLen = 0;
+  let bitBuffer = 0;
+  let bitLength = 0;
+
+  const tableSize = 16411;
+  const keys = new Int32Array(tableSize).fill(-1);
+  const values = new Uint16Array(tableSize);
 
   const emit = (code, size) => {
-    bitBuf |= code << bitLen;
-    bitLen += size;
-    while (bitLen >= 8) {
-      output.push(bitBuf & 0xff);
-      bitBuf >>= 8;
-      bitLen -= 8;
+    bitBuffer |= code << bitLength;
+    bitLength += size;
+    while (bitLength >= 8) {
+      output.push(bitBuffer & 255);
+      bitBuffer >>= 8;
+      bitLength -= 8;
     }
   };
 
-  // Hash table: key = (prefix << 8) | suffix  →  code
-  const TABLE_SIZE = 16411; // prime > 4096*4
-  const keys   = new Int32Array(TABLE_SIZE).fill(-1);
-  const values = new Uint16Array(TABLE_SIZE);
-
-  const tableClear = () => { keys.fill(-1); };
-  const tableGet = (k) => {
-    let i = (k * 2654435761) >>> 0 & (TABLE_SIZE - 1); // Knuth hash, power-of-2 table size won't work so use mod
-    i = ((k >>> 0) % TABLE_SIZE);
-    while (keys[i] !== -1 && keys[i] !== k) i = (i + 1) % TABLE_SIZE;
-    return keys[i] === k ? values[i] : -1;
+  const tableGet = (key) => {
+    let index = (key >>> 0) % tableSize;
+    while (keys[index] !== -1 && keys[index] !== key) index = (index + 1) % tableSize;
+    return keys[index] === key ? values[index] : -1;
   };
-  const tableSet = (k, v) => {
-    let i = ((k >>> 0) % TABLE_SIZE);
-    while (keys[i] !== -1 && keys[i] !== k) i = (i + 1) % TABLE_SIZE;
-    keys[i] = k; values[i] = v;
+
+  const tableSet = (key, value) => {
+    let index = (key >>> 0) % tableSize;
+    while (keys[index] !== -1 && keys[index] !== key) index = (index + 1) % tableSize;
+    keys[index] = key;
+    values[index] = value;
   };
 
   let codeSize = minCodeSize + 1;
-  let nextCode = EOI + 1;
+  let nextCode = end + 1;
 
   const reset = () => {
-    tableClear();
+    keys.fill(-1);
     codeSize = minCodeSize + 1;
-    nextCode = EOI + 1;
-    emit(CLEAR, codeSize);
+    nextCode = end + 1;
+    emit(clear, codeSize);
   };
 
   reset();
 
-  let prefix = indices[0];
-  for (let i = 1; i < indices.length; i++) {
+  let prefix = indices[0] || 0;
+
+  for (let i = 1; i < indices.length; i += 1) {
     const suffix = indices[i];
     const key = (prefix << 8) | suffix;
     const found = tableGet(key);
@@ -536,136 +594,150 @@ function lzwEncode(indices, minCodeSize) {
       prefix = found;
     } else {
       emit(prefix, codeSize);
-      if (nextCode < MAX_CODE) {
-        tableSet(key, nextCode++);
-        // Grow code size when we've used all codes at current width
-        if (nextCode > (1 << codeSize) && codeSize < 12) codeSize++;
+      if (nextCode < maxCode) {
+        tableSet(key, nextCode);
+        nextCode += 1;
+        if (nextCode > (1 << codeSize) && codeSize < 12) codeSize += 1;
       } else {
         reset();
       }
       prefix = suffix;
     }
   }
+
   emit(prefix, codeSize);
-  emit(EOI, codeSize);
-  if (bitLen > 0) output.push(bitBuf & 0xff);
+  emit(end, codeSize);
+  if (bitLength > 0) output.push(bitBuffer & 255);
   return output;
 }
 
-// ── GIF frame renderer ──────────────────────────────────────────────────────
-// 4-entry palette: white, skeleton-base, shine-highlight, unused(=base)
-const GIF_PALETTE = [
-  [255, 255, 255],  // 0 = background white
-  [226, 232, 240],  // 1 = skeleton block base  (#e2e8f0)
-  [248, 250, 252],  // 2 = shine highlight       (#f8fafc)
-  [203, 213, 225],  // 3 = skeleton edge shadow  (#cbd5e1)
+const baseGifPalette = [
+  [255, 255, 255],
+  [226, 232, 240],
+  [248, 250, 252],
+  [203, 213, 225],
 ];
 
-function nearestPaletteIndex(r, g, b) {
-  let best = 0, bestDist = Infinity;
-  for (let i = 0; i < GIF_PALETTE.length; i++) {
-    const [pr, pg, pb] = GIF_PALETTE[i];
-    const d = (r-pr)**2 + (g-pg)**2 + (b-pb)**2;
-    if (d < bestDist) { bestDist = d; best = i; }
+function nearestPaletteIndex(r, g, b, palette) {
+  let best = 0;
+  let bestDistance = Infinity;
+  for (let i = 0; i < palette.length; i += 1) {
+    const [paletteR, paletteG, paletteB] = palette[i];
+    const distance = (r - paletteR) ** 2 + (g - paletteG) ** 2 + (b - paletteB) ** 2;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = i;
+    }
   }
   return best;
 }
 
-function renderGifFrame(progress) {
-  const scale  = Math.min(480 / canvas.width, 360 / canvas.height, 1);
-  const width  = Math.max(1, Math.round(canvas.width  * scale));
+function gifBudget() {
+  const targetMb = Math.max(0.1, Number(controls.targetSize.value) || 1);
+  const frameScale = Math.min(1, Math.max(0.36, Math.sqrt(targetMb / 1.6)));
+  const frames = Math.max(6, Math.min(24, Math.round(10 + targetMb * 6)));
+  return {
+    frames,
+    maxWidth: Math.round(480 * frameScale),
+    maxHeight: Math.round(360 * frameScale),
+  };
+}
+
+function gifPalette() {
+  if (!controls.useColor.checked || !shapes.length) return baseGifPalette;
+  const palette = [[255, 255, 255], [248, 250, 252]];
+  for (const shape of shapes.slice(0, 6)) {
+    palette.push(shape.color.palette);
+  }
+  while (palette.length < 8) palette.push([226, 232, 240]);
+  return palette.slice(0, 8);
+}
+
+function renderGifFrame(progress, budget, palette) {
+  const scale = Math.min(budget.maxWidth / canvas.width, budget.maxHeight / canvas.height, 1);
+  const width = Math.max(1, Math.round(canvas.width * scale));
   const height = Math.max(1, Math.round(canvas.height * scale));
-  const off = document.createElement("canvas");
-  off.width = width; off.height = height;
-  const gctx = off.getContext("2d", { willReadFrequently: true });
+  const offscreen = document.createElement("canvas");
+  offscreen.width = width;
+  offscreen.height = height;
+  const gifCtx = offscreen.getContext("2d", { willReadFrequently: true });
 
-  gctx.fillStyle = "#ffffff";
-  gctx.fillRect(0, 0, width, height);
-
-  const shineW = Math.round(width * 0.45);
-  const sweepX = Math.round((width + shineW * 2) * progress) - shineW;
+  gifCtx.fillStyle = "#ffffff";
+  gifCtx.fillRect(0, 0, width, height);
+  const shineWidth = Math.round(width * 0.45);
+  const shineX = Math.round((width + shineWidth * 2) * progress) - shineWidth;
 
   for (const shape of shapes) {
-    const sx = Math.round(shape.x * scale);
-    const sy = Math.round(shape.y * scale);
-    const sw = Math.max(2, Math.round(shape.width  * scale));
-    const sh = Math.max(2, Math.round(shape.height * scale));
+    const x = Math.round(shape.x * scale);
+    const y = Math.round(shape.y * scale);
+    const shapeWidth = Math.max(2, Math.round(shape.width * scale));
+    const shapeHeight = Math.max(2, Math.round(shape.height * scale));
+    gifCtx.fillStyle = controls.useColor.checked ? shape.color.fill : "#e2e8f0";
+    gifCtx.fillRect(x, y, shapeWidth, shapeHeight);
 
-    gctx.fillStyle = "#e2e8f0";
-    gctx.fillRect(sx, sy, sw, sh);
-
-    gctx.save();
-    gctx.beginPath();
-    gctx.rect(sx, sy, sw, sh);
-    gctx.clip();
-    const grad = gctx.createLinearGradient(sweepX, 0, sweepX + shineW, 0);
-    grad.addColorStop(0,   "#e2e8f0");
-    grad.addColorStop(0.3, "#f0f4f8");
-    grad.addColorStop(0.5, "#f8fafc");
-    grad.addColorStop(0.7, "#f0f4f8");
-    grad.addColorStop(1,   "#e2e8f0");
-    gctx.fillStyle = grad;
-    gctx.fillRect(sweepX, sy, shineW, sh);
-    gctx.restore();
+    gifCtx.save();
+    gifCtx.beginPath();
+    gifCtx.rect(x, y, shapeWidth, shapeHeight);
+    gifCtx.clip();
+    const gradient = gifCtx.createLinearGradient(shineX, 0, shineX + shineWidth, 0);
+    gradient.addColorStop(0, controls.useColor.checked ? shape.color.fill : "#e2e8f0");
+    gradient.addColorStop(0.5, controls.useColor.checked ? shape.color.shine : "#f8fafc");
+    gradient.addColorStop(1, controls.useColor.checked ? shape.color.fill : "#e2e8f0");
+    gifCtx.fillStyle = gradient;
+    gifCtx.fillRect(shineX, y, shineWidth, shapeHeight);
+    gifCtx.restore();
   }
 
-  const data = gctx.getImageData(0, 0, width, height).data;
+  const data = gifCtx.getImageData(0, 0, width, height).data;
   const indices = new Uint8Array(width * height);
-  for (let i = 0; i < indices.length; i++) {
-    indices[i] = nearestPaletteIndex(data[i*4], data[i*4+1], data[i*4+2]);
+  for (let i = 0; i < indices.length; i += 1) {
+    indices[i] = nearestPaletteIndex(data[i * 4], data[i * 4 + 1], data[i * 4 + 2], palette);
   }
+
   return { width, height, indices };
 }
 
-// ── GIF blob assembler ───────────────────────────────────────────────────────
 function gifBlob() {
-  const frames = 20;
-  const first  = renderGifFrame(0);
-  const bytes  = [];
-
-  // Header
+  const budget = gifBudget();
+  const palette = gifPalette();
+  const minCodeSize = Math.max(2, Math.ceil(Math.log2(palette.length)));
+  const colorTableSize = 1 << minCodeSize;
+  while (palette.length < colorTableSize) palette.push([226, 232, 240]);
+  const firstFrame = renderGifFrame(0, budget, palette);
+  const bytes = [];
   pushString(bytes, "GIF89a");
-  pushWord(bytes, first.width);
-  pushWord(bytes, first.height);
-  // Packed: GCT present | colour-res=001 | no sort | GCT size=001 (4 entries)
-  // 0b10010001 = 1_001_0_001
-  bytes.push(0b10010001, 0, 0);
-  for (const [r, g, b] of GIF_PALETTE) bytes.push(r, g, b);
-
-  // Netscape looping extension
+  pushWord(bytes, firstFrame.width);
+  pushWord(bytes, firstFrame.height);
+  bytes.push(0b10000000 | ((minCodeSize - 1) << 4) | (minCodeSize - 1), 0, 0);
+  for (const [r, g, b] of palette) bytes.push(r, g, b);
   bytes.push(0x21, 0xff, 0x0b);
   pushString(bytes, "NETSCAPE2.0");
   bytes.push(0x03, 0x01);
-  pushWord(bytes, 0);  // 0 = loop forever
-  bytes.push(0x00);    // block terminator
+  pushWord(bytes, 0);
+  bytes.push(0x00);
 
-  for (let i = 0; i < frames; i++) {
-    const frame = renderGifFrame(i / frames);
-
-    // Graphic Control Extension
-    // Disposal bits 4-2: 010 << 2 = 0b00001000 = restore-to-bg
+  for (let i = 0; i < budget.frames; i += 1) {
+    const frame = i === 0 ? firstFrame : renderGifFrame(i / budget.frames, budget, palette);
     bytes.push(0x21, 0xf9, 0x04, 0b00001000);
-    pushWord(bytes, 6);        // 60ms delay
-    bytes.push(0x00, 0x00);    // transparent idx (unused) + block terminator
-
-    // Image Descriptor
+    pushWord(bytes, 6);
+    bytes.push(0x00, 0x00);
     bytes.push(0x2c);
-    pushWord(bytes, 0); pushWord(bytes, 0);
+    pushWord(bytes, 0);
+    pushWord(bytes, 0);
     pushWord(bytes, frame.width);
     pushWord(bytes, frame.height);
-    bytes.push(0x00);  // no local palette, not interlaced
-
-    // Image Data
-    bytes.push(2);  // LZW min code size
-    bytes.push(...subBlocks(lzwEncode(frame.indices, 2)));
+    bytes.push(0);
+    bytes.push(minCodeSize);
+    bytes.push(...subBlocks(lzwEncode(frame.indices, minCodeSize)));
   }
 
-  bytes.push(0x3b);  // GIF trailer
+  bytes.push(0x3b);
   return new Blob([new Uint8Array(bytes)], { type: "image/gif" });
 }
 
 async function downloadExport() {
-  const name = currentName || "skeleton-loader";
+  if (!currentImage) return;
+  const name = safeFileName(exportName.value || currentName);
   if (exportMode() === "lottie") {
     downloadBlob(new Blob([lottieMarkup()], { type: "application/json" }), `${name}.json`);
     return;
@@ -673,75 +745,64 @@ async function downloadExport() {
 
   downloadButton.disabled = true;
   downloadButton.textContent = "Rendering GIF...";
-  await new Promise((resolve) => setTimeout(resolve, 0)); // yield to browser
+  await new Promise((resolve) => setTimeout(resolve, 0));
   try {
-    downloadBlob(gifBlob(), `${name}.gif`);
+    const blob = gifBlob();
+    downloadBlob(blob, `${name}.gif`);
+    renderExportMeta(`GIF ready: ${(blob.size / 1024 / 1024).toFixed(2)} MB.`);
   } finally {
     downloadButton.disabled = false;
-    renderCode();
+    downloadButton.textContent = "Download GIF";
   }
 }
 
-// ─── DEMO ─────────────────────────────────────────────────────────────────────
-function drawSample() {
-  setCanvasSize(900, 640);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#1e293b";
-  ctx.fillRect(58, 54, 120, 28);
-  ctx.fillRect(60, 140, 380, 42);
-  ctx.fillRect(60, 202, 510, 18);
-  ctx.fillRect(60, 234, 460, 18);
-  ctx.fillRect(60, 296, 146, 46);
-  ctx.fillRect(238, 296, 126, 46);
-  ctx.fillRect(628, 88, 210, 210);
-  ctx.fillRect(60, 420, 210, 130);
-  ctx.fillRect(326, 420, 210, 130);
-  ctx.fillRect(592, 420, 210, 130);
-  currentName = "sample-layout";
-  currentImage = null;
-  generateSkeleton();
-  fileName.textContent = "Demo layout";
-  setUploadState("success", "Demo layout loaded");
-}
-
-// ─── EVENT LISTENERS ──────────────────────────────────────────────────────────
 fileInput.addEventListener("change", (event) => {
   loadFile(event.target.files[0]).catch((error) => {
     fileName.textContent = error.message;
   });
 });
 
-document.querySelector(".drop-zone").addEventListener("dragover", (event) => {
+dropZone.addEventListener("dragover", (event) => {
   event.preventDefault();
 });
 
-document.querySelector(".drop-zone").addEventListener("drop", (event) => {
+dropZone.addEventListener("drop", (event) => {
   event.preventDefault();
   loadFile(event.dataTransfer.files[0]).catch((error) => {
     fileName.textContent = error.message;
   });
 });
 
-Object.values(controls).forEach((control) => {
+removeFileButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  clearFile();
+});
+
+[controls.threshold, controls.shapeLimit, controls.radius, controls.useColor, controls.targetSize].forEach((control) => {
   control.addEventListener("input", () => {
-    if (currentImage) {
-      drawCurrentImage();
-    } else {
-      generateSkeleton();
-    }
+    updateControlLabels();
+    if (currentImage) drawCurrentImage();
+    renderExportMeta();
+  });
+});
+
+document.querySelectorAll("input[name='controlMode']").forEach((input) => {
+  input.addEventListener("change", () => {
+    updateControlLabels();
+    if (currentImage) drawCurrentImage();
   });
 });
 
 document.querySelectorAll("input[name='exportMode']").forEach((input) => {
-  input.addEventListener("change", renderCode);
+  input.addEventListener("change", renderExportMeta);
 });
 
-document.querySelector("#sampleButton").addEventListener("click", drawSample);
+exportName.addEventListener("input", () => {
+  currentName = safeFileName(exportName.value);
+});
+
 downloadButton.addEventListener("click", downloadExport);
-copyButton.addEventListener("click", async () => {
-  if (exportMode() === "gif") return;
-  await navigator.clipboard.writeText(outputCode.value);
-});
 
-drawSample();
+updateControlLabels();
+clearFile();
