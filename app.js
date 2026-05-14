@@ -476,199 +476,191 @@ function subBlocks(bytes) {
   return blocks;
 }
 
+// ── GIF LZW encoder ────────────────────────────────────────────────────────
+// Uses a flat hash table keyed by (prefix_code << 8 | suffix_byte) so keys
+// are always unique integers — no string concatenation, no ambiguity.
 function lzwEncode(indices, minCodeSize) {
-  const clear = 1 << minCodeSize;
-  const end = clear + 1;
-  let codeSize = minCodeSize + 1;
-  let nextCode = end + 1;
-  const dictionary = new Map();
+  const CLEAR = 1 << minCodeSize;
+  const EOI   = CLEAR + 1;
+  const MAX_CODE = 4096;
+
   const output = [];
-  let bitBuffer = 0;
-  let bitLength = 0;
+  let bitBuf = 0, bitLen = 0;
 
-  const resetDictionary = () => {
-    dictionary.clear();
-    for (let i = 0; i < clear; i += 1) dictionary.set(String(i), i);
-    codeSize = minCodeSize + 1;
-    nextCode = end + 1;
-  };
-
-  const writeCode = (code) => {
-    bitBuffer |= code << bitLength;
-    bitLength += codeSize;
-    while (bitLength >= 8) {
-      output.push(bitBuffer & 255);
-      bitBuffer >>= 8;
-      bitLength -= 8;
+  const emit = (code, size) => {
+    bitBuf |= code << bitLen;
+    bitLen += size;
+    while (bitLen >= 8) {
+      output.push(bitBuf & 0xff);
+      bitBuf >>= 8;
+      bitLen -= 8;
     }
   };
 
-  resetDictionary();
-  writeCode(clear);
-  let phrase = String(indices[0] || 0);
+  // Hash table: key = (prefix << 8) | suffix  →  code
+  const TABLE_SIZE = 16411; // prime > 4096*4
+  const keys   = new Int32Array(TABLE_SIZE).fill(-1);
+  const values = new Uint16Array(TABLE_SIZE);
 
-  for (let i = 1; i < indices.length; i += 1) {
-    const next = indices[i];
-    const combined = `${phrase},${next}`;
-    if (dictionary.has(combined)) {
-      phrase = combined;
+  const tableClear = () => { keys.fill(-1); };
+  const tableGet = (k) => {
+    let i = (k * 2654435761) >>> 0 & (TABLE_SIZE - 1); // Knuth hash, power-of-2 table size won't work so use mod
+    i = ((k >>> 0) % TABLE_SIZE);
+    while (keys[i] !== -1 && keys[i] !== k) i = (i + 1) % TABLE_SIZE;
+    return keys[i] === k ? values[i] : -1;
+  };
+  const tableSet = (k, v) => {
+    let i = ((k >>> 0) % TABLE_SIZE);
+    while (keys[i] !== -1 && keys[i] !== k) i = (i + 1) % TABLE_SIZE;
+    keys[i] = k; values[i] = v;
+  };
+
+  let codeSize = minCodeSize + 1;
+  let nextCode = EOI + 1;
+
+  const reset = () => {
+    tableClear();
+    codeSize = minCodeSize + 1;
+    nextCode = EOI + 1;
+    emit(CLEAR, codeSize);
+  };
+
+  reset();
+
+  let prefix = indices[0];
+  for (let i = 1; i < indices.length; i++) {
+    const suffix = indices[i];
+    const key = (prefix << 8) | suffix;
+    const found = tableGet(key);
+    if (found !== -1) {
+      prefix = found;
     } else {
-      writeCode(dictionary.get(phrase));
-      if (nextCode < 4096) {
-        dictionary.set(combined, nextCode);
-        nextCode += 1;
-        if (nextCode === (1 << codeSize) && codeSize < 12) codeSize += 1;
+      emit(prefix, codeSize);
+      if (nextCode < MAX_CODE) {
+        tableSet(key, nextCode++);
+        // Grow code size when we've used all codes at current width
+        if (nextCode > (1 << codeSize) && codeSize < 12) codeSize++;
       } else {
-        writeCode(clear);
-        resetDictionary();
+        reset();
       }
-      phrase = String(next);
+      prefix = suffix;
     }
   }
-
-  writeCode(dictionary.get(phrase));
-  writeCode(end);
-  if (bitLength > 0) output.push(bitBuffer & 255);
+  emit(prefix, codeSize);
+  emit(EOI, codeSize);
+  if (bitLen > 0) output.push(bitBuf & 0xff);
   return output;
 }
 
-// BUG FIX: renderGifIndices was creating a new offscreen canvas every frame,
-// then clipping and drawing gradients per-shape — but GIF only has a 4-colour
-// palette (declared as 0xf1 = 2-bit = 4 entries). The gradient produces many
-// intermediate RGB values that all get quantised to index 1 (mid-grey),
-// making the shimmer invisible. The fix: draw the shimmer on canvas, then
-// quantise to the 4-entry palette using nearest-colour matching, not luminance bands.
-// Also: the GIF header declared palette size 0xf1 (4 colours) but lzwEncode
-// was called with minCodeSize=2, which is correct — but we need exactly 4 palette
-// entries with no padding. Added a proper 4-colour quantiser.
-//
-// CRITICAL GIF BUG: the Graphic Control Extension disposal byte was 0x00
-// (do not dispose). This means each frame composites ON TOP of the previous
-// frame rather than replacing it — so the GIF appears frozen (only the first
-// frame is ever "new"). Fixed by setting disposal to 0x02 (restore to bg).
-// Also: frame delay was written as pushWord(bytes, 7) = 70ms. With 24 frames
-// that's 1.68s total, but the shimmer sweep needs to complete in exactly one
-// loop. Adjusted to 6 (60ms) for a 1.44s loop matching the CSS animation.
-
-// 4-entry palette: white, dark-grey (skeleton bg), light-grey (shine peak), mid-grey
+// ── GIF frame renderer ──────────────────────────────────────────────────────
+// 4-entry palette: white, skeleton-base, shine-highlight, unused(=base)
 const GIF_PALETTE = [
-  [255, 255, 255],   // 0 = background white
-  [226, 232, 240],   // 1 = skeleton block base (#e2e8f0)
-  [248, 250, 252],   // 2 = shine highlight (#f8fafc)
-  [203, 213, 225],   // 3 = skeleton block shadow (#cbd5e1)
+  [255, 255, 255],  // 0 = background white
+  [226, 232, 240],  // 1 = skeleton block base  (#e2e8f0)
+  [248, 250, 252],  // 2 = shine highlight       (#f8fafc)
+  [203, 213, 225],  // 3 = skeleton edge shadow  (#cbd5e1)
 ];
 
 function nearestPaletteIndex(r, g, b) {
-  let best = 0;
-  let bestDist = Infinity;
+  let best = 0, bestDist = Infinity;
   for (let i = 0; i < GIF_PALETTE.length; i++) {
     const [pr, pg, pb] = GIF_PALETTE[i];
-    const dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
-    if (dist < bestDist) { bestDist = dist; best = i; }
+    const d = (r-pr)**2 + (g-pg)**2 + (b-pb)**2;
+    if (d < bestDist) { bestDist = d; best = i; }
   }
   return best;
 }
 
 function renderGifFrame(progress) {
-  // Keep GIF dimensions to max 480px wide so file size stays sane
-  const scale = Math.min(480 / canvas.width, 360 / canvas.height, 1);
-  const width = Math.max(1, Math.round(canvas.width * scale));
+  const scale  = Math.min(480 / canvas.width, 360 / canvas.height, 1);
+  const width  = Math.max(1, Math.round(canvas.width  * scale));
   const height = Math.max(1, Math.round(canvas.height * scale));
-  const offscreen = document.createElement("canvas");
-  offscreen.width = width;
-  offscreen.height = height;
-  const gifCtx = offscreen.getContext("2d", { willReadFrequently: true });
+  const off = document.createElement("canvas");
+  off.width = width; off.height = height;
+  const gctx = off.getContext("2d", { willReadFrequently: true });
 
-  // Background
-  gifCtx.fillStyle = "#ffffff";
-  gifCtx.fillRect(0, 0, width, height);
+  gctx.fillStyle = "#ffffff";
+  gctx.fillRect(0, 0, width, height);
 
-  // Shine sweep: one unified X position across the whole frame
-  // progress 0→1 maps from off-screen-left to off-screen-right
   const shineW = Math.round(width * 0.45);
   const sweepX = Math.round((width + shineW * 2) * progress) - shineW;
 
   for (const shape of shapes) {
     const sx = Math.round(shape.x * scale);
     const sy = Math.round(shape.y * scale);
-    const sw = Math.max(2, Math.round(shape.width * scale));
+    const sw = Math.max(2, Math.round(shape.width  * scale));
     const sh = Math.max(2, Math.round(shape.height * scale));
 
-    // Base block colour
-    gifCtx.fillStyle = "#e2e8f0";
-    gifCtx.fillRect(sx, sy, sw, sh);
+    gctx.fillStyle = "#e2e8f0";
+    gctx.fillRect(sx, sy, sw, sh);
 
-    // Clipped shine stripe
-    gifCtx.save();
-    gifCtx.beginPath();
-    gifCtx.rect(sx, sy, sw, sh);
-    gifCtx.clip();
-    const grad = gifCtx.createLinearGradient(sweepX, 0, sweepX + shineW, 0);
-    grad.addColorStop(0,    "#e2e8f0");
-    grad.addColorStop(0.3,  "#f0f4f8");
-    grad.addColorStop(0.5,  "#f8fafc");
-    grad.addColorStop(0.7,  "#f0f4f8");
-    grad.addColorStop(1,    "#e2e8f0");
-    gifCtx.fillStyle = grad;
-    gifCtx.fillRect(sweepX, sy, shineW, sh);
-    gifCtx.restore();
+    gctx.save();
+    gctx.beginPath();
+    gctx.rect(sx, sy, sw, sh);
+    gctx.clip();
+    const grad = gctx.createLinearGradient(sweepX, 0, sweepX + shineW, 0);
+    grad.addColorStop(0,   "#e2e8f0");
+    grad.addColorStop(0.3, "#f0f4f8");
+    grad.addColorStop(0.5, "#f8fafc");
+    grad.addColorStop(0.7, "#f0f4f8");
+    grad.addColorStop(1,   "#e2e8f0");
+    gctx.fillStyle = grad;
+    gctx.fillRect(sweepX, sy, shineW, sh);
+    gctx.restore();
   }
 
-  // Quantise to palette
-  const data = gifCtx.getImageData(0, 0, width, height).data;
+  const data = gctx.getImageData(0, 0, width, height).data;
   const indices = new Uint8Array(width * height);
   for (let i = 0; i < indices.length; i++) {
-    indices[i] = nearestPaletteIndex(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
+    indices[i] = nearestPaletteIndex(data[i*4], data[i*4+1], data[i*4+2]);
   }
-
   return { width, height, indices };
 }
 
+// ── GIF blob assembler ───────────────────────────────────────────────────────
 function gifBlob() {
   const frames = 20;
-  const firstFrame = renderGifFrame(0);
-  const bytes = [];
+  const first  = renderGifFrame(0);
+  const bytes  = [];
 
-  // GIF Header
+  // Header
   pushString(bytes, "GIF89a");
-  pushWord(bytes, firstFrame.width);
-  pushWord(bytes, firstFrame.height);
-  // Global colour table flag=1, colour resolution=1, sort=0, size=1 (4 colours = 2^(1+1))
-  bytes.push(0b10110001, 0, 0); // packed: GCT present, 2-bit palette
-  // Global colour table (4 × 3 bytes)
+  pushWord(bytes, first.width);
+  pushWord(bytes, first.height);
+  // Packed: GCT present | colour-res=001 | no sort | GCT size=001 (4 entries)
+  // 0b10010001 = 1_001_0_001
+  bytes.push(0b10010001, 0, 0);
   for (const [r, g, b] of GIF_PALETTE) bytes.push(r, g, b);
 
   // Netscape looping extension
   bytes.push(0x21, 0xff, 0x0b);
   pushString(bytes, "NETSCAPE2.0");
   bytes.push(0x03, 0x01);
-  pushWord(bytes, 0); // loop count 0 = infinite
-  bytes.push(0x00);
+  pushWord(bytes, 0);  // 0 = loop forever
+  bytes.push(0x00);    // block terminator
 
   for (let i = 0; i < frames; i++) {
     const frame = renderGifFrame(i / frames);
 
     // Graphic Control Extension
-    bytes.push(
-      0x21, 0xf9, 0x04,
-      0b00000010, // disposal=2 (restore to bg), no user input, no transparent
-    );
-    pushWord(bytes, 6); // delay = 6 × 10ms = 60ms → 20 frames × 60ms = 1.2s loop
-    bytes.push(0x00, 0x00); // no transparent colour index, block terminator
+    // Disposal bits 4-2: 010 << 2 = 0b00001000 = restore-to-bg
+    bytes.push(0x21, 0xf9, 0x04, 0b00001000);
+    pushWord(bytes, 6);        // 60ms delay
+    bytes.push(0x00, 0x00);    // transparent idx (unused) + block terminator
 
     // Image Descriptor
     bytes.push(0x2c);
-    pushWord(bytes, 0); pushWord(bytes, 0); // top-left x, y
+    pushWord(bytes, 0); pushWord(bytes, 0);
     pushWord(bytes, frame.width);
     pushWord(bytes, frame.height);
-    bytes.push(0x00); // no local colour table, not interlaced
+    bytes.push(0x00);  // no local palette, not interlaced
 
-    // LZW min code size then compressed data
-    bytes.push(2);
+    // Image Data
+    bytes.push(2);  // LZW min code size
     bytes.push(...subBlocks(lzwEncode(frame.indices, 2)));
   }
 
-  bytes.push(0x3b); // GIF trailer
+  bytes.push(0x3b);  // GIF trailer
   return new Blob([new Uint8Array(bytes)], { type: "image/gif" });
 }
 
